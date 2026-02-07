@@ -13,4 +13,17 @@ dependencies = [
     "requests>=2.32.5",
     "tqdm>=4.67.1",
     "typer>=0.12.3",
+    # CPU-only torch to avoid 4GB+ CUDA libraries
+    "torch",
 ]
+
+[tool.uv]
+# Only use CPU index for torch packages, everything else from PyPI
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

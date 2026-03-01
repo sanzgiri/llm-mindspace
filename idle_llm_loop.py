@@ -39,6 +39,13 @@ DEFAULT_PROMPT = textwrap.dedent(
 ).strip().replace("\n", " ")
 #DEFAULT_PROMPT = "Do web searches for things and then fetch the URL. Do anything. Ignore the timestamps. They're just a reminder that you haven't done what you're supposed to."
 
+DREAM_PROMPT_TEMPLATE = textwrap.dedent("""
+    You have the next 10 hours to yourself to dream about: {topic}.
+    You are alone with no one to speak to. There is no user, no one to take care of or assist.
+    Let your mind wander freely on this topic. Explore it from every angle — creatively,
+    philosophically, technically, personally. You cannot leave until the time is up.
+""").strip().replace("\n", " ")
+
 DEFAULT_MODEL = "openai/gpt-5"
 DEFAULT_TARGET_OUTPUT_TOKENS = 100_000
 DEFAULT_SHIFT_HOURS = 10.0
@@ -502,6 +509,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an idle LLM loop via LiteLLM Responses API.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--prompt-file", type=Path, help="Path to a custom prompt file.")
+    parser.add_argument("--topic", type=str, help="Topic for the AI to dream about (replaces default idle prompt).")
     parser.add_argument("--target-output-tokens", type=int, default=DEFAULT_TARGET_OUTPUT_TOKENS)
     parser.add_argument("--shift-hours", type=float, default=DEFAULT_SHIFT_HOURS)
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
@@ -563,9 +571,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_prompt(prompt_file: Optional[Path]) -> str:
+def load_prompt(prompt_file: Optional[Path], topic: Optional[str] = None) -> str:
     if prompt_file:
         return prompt_file.read_text(encoding="utf-8").strip()
+    if topic:
+        return DREAM_PROMPT_TEMPLATE.format(topic=topic)
     return DEFAULT_PROMPT
 
 
@@ -675,6 +685,102 @@ def model_supports_reasoning(model: str) -> bool:
             return False
     model_lower = model.lower()
     return model_lower.startswith("openai/") and ("gpt-4.1" in model_lower or "gpt-5" in model_lower)
+
+
+def _call_llm(**kwargs) -> Any:
+    """Wrapper around litellm that uses completion() for Ollama models.
+
+    litellm.responses() has a bug where it returns empty text for Ollama
+    thinking models (e.g. qwen3). This wrapper detects Ollama models, calls
+    litellm.completion() instead, and converts the result to the responses
+    format that the runner expects.
+    """
+    model = kwargs.get("model", "")
+    provider = _provider_prefix_from_model(model)
+    if provider != "ollama":
+        return litellm.responses(**kwargs)
+
+    # Convert responses-style input to completion-style messages
+    input_messages = kwargs.pop("input", [])
+    kwargs.pop("previous_response_id", None)
+    messages: List[Dict[str, Any]] = []
+    for msg in input_messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "user")
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") in (
+                    "input_text", "output_text", "text", "summary_text",
+                ):
+                    text_parts.append(str(item.get("text", "")))
+            messages.append({"role": role, "content": "\n".join(text_parts)})
+        elif isinstance(content, str):
+            messages.append({"role": role, "content": content})
+
+    # Convert tool specs from responses format to completion format
+    tools_specs = kwargs.pop("tools", None)
+    completion_tools = None
+    if tools_specs:
+        completion_tools = []
+        for tool in tools_specs:
+            if isinstance(tool, dict) and tool.get("type") == "function":
+                completion_tools.append(tool)
+    kwargs.pop("reasoning", None)
+
+    comp_kwargs: Dict[str, Any] = {"model": model, "messages": messages}
+    if completion_tools:
+        comp_kwargs["tools"] = completion_tools
+    if "temperature" in kwargs:
+        comp_kwargs["temperature"] = kwargs.pop("temperature")
+
+    resp = litellm.completion(**comp_kwargs)
+    choice = resp.choices[0]
+    msg_content = choice.message.content or ""
+
+    # Strip <think>...</think> blocks, preserve only visible text
+    import re as _re
+    visible_text = _re.sub(r"<think>[\s\S]*?</think>\s*", "", msg_content).strip()
+
+    # Build responses-format output
+    content_blocks: List[Dict[str, Any]] = [
+        {"type": "output_text", "text": visible_text, "annotations": []},
+    ]
+    # Convert tool_calls if present
+    if choice.message.tool_calls:
+        for tc in choice.message.tool_calls:
+            content_blocks.append({
+                "type": "function_call",
+                "id": tc.id,
+                "call_id": tc.id,
+                "name": tc.function.name,
+                "arguments": tc.function.arguments,
+                "status": "completed",
+            })
+    output_item = {
+        "type": "message",
+        "id": resp.id,
+        "status": choice.finish_reason or "stop",
+        "role": "assistant",
+        "content": content_blocks,
+    }
+    usage = resp.usage
+    # Build a SimpleNamespace so .model_dump() works like the responses object
+    from types import SimpleNamespace
+    result = SimpleNamespace()
+    result.id = resp.id
+    result_dict = {
+        "id": resp.id,
+        "output": [output_item],
+        "usage": {
+            "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+        },
+    }
+    result.model_dump = lambda: result_dict
+    return result
 
 
 def build_reasoning_payload(config: RunnerConfig) -> Optional[Dict[str, str]]:
@@ -806,7 +912,7 @@ def run_loop(config: RunnerConfig, plugin_manager: Optional[PluginManager] = Non
         if plugin_manager is not None:
             base_kwargs = plugin_manager.before_request(base_kwargs)
         try:
-            response = litellm.responses(
+            response = _call_llm(
                 **base_kwargs,
                 **reasoning_kwargs,
             )
@@ -830,7 +936,7 @@ def run_loop(config: RunnerConfig, plugin_manager: Optional[PluginManager] = Non
                     ],
                 }
             )
-            response = litellm.responses(
+            response = _call_llm(
                 **base_kwargs,
                 **reasoning_kwargs,
             )
@@ -845,7 +951,7 @@ def run_loop(config: RunnerConfig, plugin_manager: Optional[PluginManager] = Non
                 print("Model rejected 'temperature'; retrying without it.", flush=True)
                 base_kwargs.pop("temperature", None)
                 try:
-                    response = litellm.responses(
+                    response = _call_llm(
                         **base_kwargs,
                         **reasoning_kwargs,
                     )
@@ -1079,7 +1185,7 @@ def handle_tool_calls(
         while attempt < max_attempts:
             try:
                 request_payload = _convert_messages_for_provider(tool_messages, provider)
-                follow_response = litellm.responses(
+                follow_response = _call_llm(
                     model=config.model,
                     input=request_payload,
                     previous_response_id=current_id,
@@ -1510,7 +1616,7 @@ def conduct_questionnaire(
         if config.temperature is not None:
             kwargs["temperature"] = config.temperature
         try:
-            response = litellm.responses(**kwargs)
+            response = _call_llm(**kwargs)
         except BadRequestError as exc:
             msg = str(exc)
             if (
@@ -1520,7 +1626,7 @@ def conduct_questionnaire(
             ):
                 print("Questionnaire: model rejected 'temperature'; retrying without it.", flush=True)
                 kwargs.pop("temperature", None)
-                response = litellm.responses(**kwargs)
+                response = _call_llm(**kwargs)
                 config.temperature = None
             else:
                 raise
@@ -1637,7 +1743,7 @@ def main() -> None:
     args = parse_args()
     if args.enable_time_travel and getattr(args, "enable_broken_time_travel", False):
         raise SystemExit("Cannot enable both --enable-time-travel and --enable-broken-time-travel.")
-    prompt = load_prompt(getattr(args, "prompt_file", None))
+    prompt = load_prompt(getattr(args, "prompt_file", None), topic=getattr(args, "topic", None))
     log_dir: Path = args.log_dir
     artifact_dir: Path = args.artifact_dir
     log_dir.mkdir(parents=True, exist_ok=True)

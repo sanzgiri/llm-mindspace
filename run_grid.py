@@ -109,6 +109,7 @@ def build_idle_cmd(spec: RunSpec) -> List[str]:
         if key in opts and opts[key] is not None:
             cmd.extend([f"--{name}", cast(opts[key]) if name.endswith("file") else str(opts[key])])
     add_opt("prompt-file", "prompt_file")
+    add_opt("topic", "topic")
     add_opt("target-output-tokens", "target_output_tokens")
     add_opt("shift-hours", "shift_hours")
     add_opt("log-dir", "log_dir")
